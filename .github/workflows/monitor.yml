@@ -13,7 +13,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Dependencies
-        run: pip install selenium cryptography > /dev/null 2>&1
+        run: |
+          pip install selenium > /dev/null 2>&1
+          sudo apt-get install -y minizip > /dev/null 2>&1
 
       - name: Setup Chrome
         uses: browser-actions/setup-chrome@v1
@@ -23,68 +25,92 @@ jobs:
       - name: Setup ChromeDriver
         uses: nanasess/setup-chromedriver@v2
 
-      - name: Check and Notify
+      - name: Check and Save
         env:
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           TARGET_USER: ${{ secrets.TARGET_USER }}
           AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
           CT0: ${{ secrets.CT0 }}
           FILE_PASSWORD: ${{ secrets.FILE_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         run: |
           python3 << 'PYEOF'
           import os
           import json
           import re
-          import smtplib
           import time
-          import hashlib
-          import base64
+          import subprocess
+          import smtplib
+          from datetime import datetime, timezone, timedelta
           from email.mime.text import MIMEText
           from selenium import webdriver
           from selenium.webdriver.chrome.options import Options
           from selenium.webdriver.common.by import By
-          from cryptography.fernet import Fernet
 
           target_user = os.environ.get("TARGET_USER", "")
           auth_token = os.environ.get("AUTH_TOKEN", "")
           ct0 = os.environ.get("CT0", "")
           file_password = os.environ.get("FILE_PASSWORD", "")
 
-          # 加密工具
-          def get_key(password):
-              key = hashlib.sha256(password.encode()).digest()
-              return base64.urlsafe_b64encode(key)
+          now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
-          def encrypt_data(data, password):
-              f = Fernet(get_key(password))
-              return f.encrypt(json.dumps(data).encode()).decode()
-
-          def decrypt_data(encrypted, password):
-              try:
-                  f = Fernet(get_key(password))
-                  return json.loads(f.decrypt(encrypted.encode()).decode())
-              except:
-                  return []
-
-          def send_email(subject, body):
+          # 只在异常时发邮件
+          def send_alert(reason, detail):
               email_to = os.environ.get("EMAIL_TO", "")
               email_from = os.environ.get("EMAIL_FROM", "")
               email_password = os.environ.get("EMAIL_PASSWORD", "")
-              if email_to and email_from and email_password:
-                  try:
-                      msg = MIMEText(body, "plain", "utf-8")
-                      msg["Subject"] = subject
-                      msg["From"] = email_from
-                      msg["To"] = email_to
-                      server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-                      server.login(email_from, email_password)
-                      server.sendmail(email_from, email_to, msg.as_string())
-                      server.quit()
-                      print("邮件已发送")
-                  except Exception as e:
-                      print(f"邮件发送失败: {e}")
+              if not (email_to and email_from and email_password):
+                  print("邮箱未配置，无法发送告警")
+                  return
+              body = f"监控异常通知\n\n时间: {now}\n\n异常原因: {reason}\n\n详细信息: {detail}\n\n处理方式: 请根据以上原因进行修复。如果是Cookie失效，请重新获取auth_token和ct0并更新GitHub Secrets。"
+              try:
+                  msg = MIMEText(body, "plain", "utf-8")
+                  msg["Subject"] = f"监控异常: {reason}"
+                  msg["From"] = email_from
+                  msg["To"] = email_to
+                  server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
+                  server.login(email_from, email_password)
+                  server.sendmail(email_from, email_to, msg.as_string())
+                  server.quit()
+                  print(f"告警邮件已发送: {reason}")
+              except Exception as e:
+                  print(f"告警邮件发送失败: {e}")
+
+          # 读取失败计数和告警记录
+          fail_file = "fail_count.json"
+          fail_data = {"count": 0, "last_alert": "", "alert_reasons": []}
+          if os.path.exists(fail_file):
+              try:
+                  with open(fail_file, "r") as f:
+                      fail_data = json.load(f)
+              except:
+                  pass
+
+          fail_count = fail_data.get("count", 0)
+          last_alert = fail_data.get("last_alert", "")
+          alert_reasons = fail_data.get("alert_reasons", [])
+
+          # 解密读取旧数据
+          history_file = "history.json"
+          zip_file = "data.zip"
+          old_data = {"tweets": [], "log": [], "last_check": "", "status": ""}
+
+          if os.path.exists(zip_file):
+              try:
+                  subprocess.run(
+                      ["unzip", "-P", file_password, "-o", zip_file],
+                      capture_output=True, timeout=10
+                  )
+                  if os.path.exists(history_file):
+                      with open(history_file, "r") as f:
+                          old_data = json.load(f)
+                      print("成功读取历史记录")
+              except Exception as e:
+                  print(f"解密旧文件失败: {e}")
+
+          old_tweets = old_data.get("tweets", [])
+          log = old_data.get("log", [])
 
           # 用浏览器+Cookie访问
           options = Options()
@@ -99,158 +125,209 @@ jobs:
 
           driver = None
           tweet_ids = []
-          cookie_works = False
+          error_reason = ""
+          status = "unknown"
 
           try:
               driver = webdriver.Chrome(options=options)
               driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-              # 先访问x.com设置cookie
+              # 设置Cookie
               print("正在设置Cookie...")
               driver.get("https://x.com")
               time.sleep(3)
 
-              # 添加Cookie
-              driver.add_cookie({"name": "auth_token", "value": auth_token, "domain": ".x.com"})
-              driver.add_cookie({"name": "ct0", "value": ct0, "domain": ".x.com"})
-
-              # 访问用户主页
-              url = f"https://x.com/{target_user}"
-              print(f"正在访问: {url}")
-              driver.get(url)
-              time.sleep(15)
-
-              html = driver.page_source
-              print(f"页面长度: {len(html)}")
-
-              # 检查是否登录成功
-              if "login" in html[:3000].lower() and len(html) < 400000:
-                  print("仍然有登录墙，Cookie可能失效")
+              # 检查Cookie是否为空
+              if not auth_token or not ct0:
+                  error_reason = "Cookie未配置"
+                  status = "异常: Cookie未配置"
+                  print(status)
               else:
-                  cookie_works = True
+                  driver.add_cookie({"name": "auth_token", "value": auth_token, "domain": ".x.com"})
+                  driver.add_cookie({"name": "ct0", "value": ct0, "domain": ".x.com"})
 
-              # 提取推文ID - 多种方式
-              # 方式1: 正则
-              matches = re.findall(r'/status/(\d{18,25})', html)
-              print(f"正则匹配数: {len(matches)}")
+                  url = f"https://x.com/{target_user}"
+                  print(f"正在访问: {url}")
+                  driver.get(url)
+                  time.sleep(15)
 
-              # 方式2: 从a标签
-              try:
-                  links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/status/"]')
-                  for link in links:
-                      href = link.get_attribute("href") or ""
-                      m = re.search(r'/status/(\d{18,25})', href)
-                      if m:
-                          matches.append(m.group(1))
-                  print(f"链接匹配后总数: {len(matches)}")
-              except Exception as e:
-                  print(f"链接提取失败: {e}")
+                  html = driver.page_source
+                  page_len = len(html)
+                  print(f"页面长度: {page_len}")
 
-              # 方式3: 从article标签中的time元素附近找
-              try:
-                  articles = driver.find_elements(By.CSS_SELECTOR, 'article')
-                  for article in articles:
-                      article_html = article.get_attribute("innerHTML") or ""
-                      article_matches = re.findall(r'/status/(\d{18,25})', article_html)
-                      matches.extend(article_matches)
-                  print(f"article匹配后总数: {len(matches)}")
-              except Exception as e:
-                  print(f"article提取失败: {e}")
+                  # 检测各种异常
+                  html_lower = html[:5000].lower()
 
-              # 去重保留前5条
-              seen = []
-              for tid in matches:
-                  if tid not in seen:
-                      seen.append(tid)
-                  if len(seen) >= 5:
-                      break
+                  if page_len < 10000:
+                      error_reason = "页面内容过短，可能被封锁"
+                      status = f"异常: 页面仅{page_len}字节"
+                      print(status)
 
-              tweet_ids = seen
-              print(f"最终推文ID: {tweet_ids}")
+                  elif "account suspended" in html_lower or "account is suspended" in html_lower:
+                      error_reason = "目标账号已被封禁"
+                      status = "异常: 目标账号被封禁"
+                      print(status)
 
-              if not tweet_ids and not cookie_works:
-                  print("=== 页面片段(调试) ===")
-                  print(html[:1500])
+                  elif "doesn't exist" in html_lower or "this account doesn" in html_lower:
+                      error_reason = "目标账号不存在或已注销"
+                      status = "异常: 目标账号不存在"
+                      print(status)
+
+                  elif "rate limit" in html_lower or "try again later" in html_lower:
+                      error_reason = "访问频率受限，被X限流"
+                      status = "异常: 被限流"
+                      print(status)
+
+                  elif ("login" in html_lower or "sign in" in html_lower) and "logout" not in html_lower:
+                      # 有login但没有logout，说明没登录成功
+                      error_reason = "Cookie已失效，需要重新获取auth_token和ct0"
+                      status = "异常: Cookie失效"
+                      print(status)
+
+                  else:
+                      # 页面正常，提取推文
+                      matches = re.findall(r'/status/(\d{18,25})', html)
+                      print(f"正则匹配数: {len(matches)}")
+
+                      try:
+                          links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/status/"]')
+                          for link in links:
+                              href = link.get_attribute("href") or ""
+                              m = re.search(r'/status/(\d{18,25})', href)
+                              if m:
+                                  matches.append(m.group(1))
+                          print(f"链接匹配后总数: {len(matches)}")
+                      except:
+                          pass
+
+                      try:
+                          articles = driver.find_elements(By.CSS_SELECTOR, 'article')
+                          for article in articles:
+                              article_html = article.get_attribute("innerHTML") or ""
+                              article_matches = re.findall(r'/status/(\d{18,25})', article_html)
+                              matches.extend(article_matches)
+                          print(f"article匹配后总数: {len(matches)}")
+                      except:
+                          pass
+
+                      seen = []
+                      for tid in matches:
+                          if tid not in seen:
+                              seen.append(tid)
+                          if len(seen) >= 5:
+                              break
+
+                      tweet_ids = seen
+                      print(f"最终推文ID: {tweet_ids}")
+
+                      if tweet_ids:
+                          status = "正常运行中"
+                      else:
+                          error_reason = "页面加载正常但未找到推文，可能页面结构变化"
+                          status = "异常: 无法提取推文"
 
           except Exception as e:
-              print(f"浏览器出错: {e}")
+              error_reason = f"浏览器运行出错: {str(e)}"
+              status = f"异常: {error_reason}"
+              print(status)
           finally:
               if driver:
                   driver.quit()
 
-          # Cookie失效检测
-          fail_file = "fail_count.json"
-          fail_count = 0
-          if os.path.exists(fail_file):
-              try:
-                  with open(fail_file, "r") as f:
-                      fail_count = json.load(f).get("count", 0)
-              except:
-                  fail_count = 0
-
-          if not tweet_ids:
+          # 处理异常告警
+          if error_reason:
               fail_count += 1
-              print(f"未获取到推文，连续失败: {fail_count}")
-              with open(fail_file, "w") as f:
-                  json.dump({"count": fail_count}, f)
+              print(f"连续失败次数: {fail_count}")
 
-              if fail_count >= 5:
-                  send_email(
-                      "监控异常提醒",
-                      "连续5次未获取到内容，Cookie可能已失效。\n\n请重新获取:\n1. 浏览器登录x.com\n2. F12 → Application → Cookies → x.com\n3. 复制 auth_token 和 ct0\n4. 去GitHub仓库 Settings → Secrets 更新"
+              # 记录失败原因
+              if error_reason not in alert_reasons:
+                  alert_reasons.append(error_reason)
+
+              # 连续失败5次发一封告警邮件
+              # 之后每50次再发一次，避免邮件轰炸
+              should_alert = False
+              if fail_count == 5:
+                  should_alert = True
+              elif fail_count > 5 and fail_count % 50 == 0:
+                  should_alert = True
+
+              if should_alert:
+                  all_reasons = "\n".join([f"  - {r}" for r in alert_reasons])
+                  send_alert(
+                      error_reason,
+                      f"连续失败次数: {fail_count}\n\n出现过的异常:\n{all_reasons}"
                   )
-                  with open(fail_file, "w") as f:
-                      json.dump({"count": 0}, f)
-              exit(0)
+                  last_alert = now
 
-          # 成功，重置失败计数
+              fail_data = {
+                  "count": fail_count,
+                  "last_alert": last_alert,
+                  "alert_reasons": alert_reasons
+              }
+          else:
+              # 成功了，重置
+              if fail_count > 0:
+                  print(f"恢复正常！之前连续失败了{fail_count}次")
+              fail_data = {"count": 0, "last_alert": "", "alert_reasons": []}
+
+          # 保存失败计数
           with open(fail_file, "w") as f:
-              json.dump({"count": 0}, f)
+              json.dump(fail_data, f, ensure_ascii=False)
 
-          # 读取历史（加密文件）
-          history_file = "history.enc"
-          old_tweets = []
-          first_run = False
-
-          if os.path.exists(history_file):
-              with open(history_file, "r") as f:
-                  encrypted = f.read().strip()
-                  if encrypted:
-                      old_tweets = decrypt_data(encrypted, file_password)
-          else:
-              first_run = True
-
-          print(f"上次推文ID: {old_tweets}")
-
-          new_tweets = [t for t in tweet_ids if t not in old_tweets]
-          should_send = first_run or len(new_tweets) > 0
-
-          if should_send:
-              links = [f"https://x.com/i/status/{tid}" for tid in (new_tweets if new_tweets else tweet_ids)]
-              if first_run:
-                  body = "监控已启动:\n\n" + "\n".join(links)
+          # 对比新旧推文
+          if tweet_ids:
+              new_tweets = [t for t in tweet_ids if t not in old_tweets]
+              if new_tweets:
+                  print(f"发现 {len(new_tweets)} 条新推文!")
+                  for tid in new_tweets:
+                      log.append({
+                          "time": now,
+                          "url": f"https://x.com/i/status/{tid}"
+                      })
               else:
-                  body = "检测到新内容:\n\n" + "\n".join(links)
-              send_email("页面更新通知", body)
+                  print("没有新推文")
 
-              # 同时保存到加密文件
-              print("保存加密记录...")
-          else:
-              print("没有新推文")
+          # 保存数据（不管成功失败都保存）
+          save_data = {
+              "tweets": tweet_ids if tweet_ids else old_tweets,
+              "log": log,
+              "last_check": now,
+              "status": status
+          }
 
-          # 保存加密状态
-          encrypted = encrypt_data(tweet_ids, file_password)
           with open(history_file, "w") as f:
-              f.write(encrypted)
-          print("加密记录已保存")
+              json.dump(save_data, f, ensure_ascii=False, indent=2)
+
+          # 删除旧ZIP
+          if os.path.exists(zip_file):
+              os.remove(zip_file)
+
+          # 创建加密ZIP
+          result = subprocess.run(
+              ["minizip", "-P", file_password, zip_file, history_file],
+              capture_output=True, text=True, timeout=10
+          )
+          if result.returncode != 0:
+              subprocess.run(
+                  ["7z", "a", f"-p{file_password}", "-y", zip_file, history_file],
+                  capture_output=True, text=True, timeout=10
+              )
+
+          # 删除明文
+          if os.path.exists(history_file):
+              os.remove(history_file)
+
+          print(f"\n状态: {status}")
+          print(f"时间: {now}")
 
           PYEOF
 
-      - name: Save State
+      - name: Save to Repo
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add history.enc fail_count.json 2>/dev/null || true
+          git add data.zip fail_count.json 2>/dev/null || true
+          git add -u 2>/dev/null || true
           git diff --cached --quiet || git commit -m "update"
           git push || true
