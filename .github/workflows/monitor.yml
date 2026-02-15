@@ -12,6 +12,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Dependencies
+        run: pip install selenium > /dev/null 2>&1
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: Setup ChromeDriver
+        uses: nanasess/setup-chromedriver@v2
+
       - name: Check and Notify
         env:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
@@ -25,115 +36,131 @@ jobs:
           import re
           import smtplib
           import time
-          import urllib.request
+          import random
           from email.mime.text import MIMEText
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
 
           target_user = os.environ.get("TARGET_USER", "")
           tweet_ids = []
 
-          # 方法1: Twitter 内嵌时间线 API
-          def try_syndication():
-              url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{target_user}"
-              headers = {
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                  "Referer": "https://platform.twitter.com/",
-                  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-              }
+          def create_driver():
+              options = Options()
+              options.add_argument("--headless=new")
+              options.add_argument("--no-sandbox")
+              options.add_argument("--disable-dev-shm-usage")
+              options.add_argument("--disable-gpu")
+              options.add_argument("--disable-blink-features=AutomationControlled")
+              options.add_argument("--window-size=1920,1080")
+              options.add_argument("--lang=en-US")
+              options.add_argument("--disable-extensions")
+              options.add_argument("--disable-infobars")
+              ua = random.choice([
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+              ])
+              options.add_argument(f"user-agent={ua}")
+              options.add_experimental_option("excludeSwitches", ["enable-automation"])
+              options.add_experimental_option("useAutomationExtension", False)
+              driver = webdriver.Chrome(options=options)
+              driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+              driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                  "source": """
+                      Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                      Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+                      Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                      window.chrome = { runtime: {} };
+                  """
+              })
+              return driver
+
+          def try_direct(user):
+              """直接访问用户主页"""
+              driver = create_driver()
               try:
-                  req = urllib.request.Request(url, headers=headers)
-                  resp = urllib.request.urlopen(req, timeout=30)
-                  html = resp.read().decode("utf-8", errors="ignore")
-                  print(f"syndication 页面长度: {len(html)}")
+                  url = f"https://x.com/{user}"
+                  print(f"直接访问: {url}")
+                  driver.get(url)
+                  time.sleep(15)
+                  html = driver.page_source
+                  print(f"页面长度: {len(html)}")
+                  
+                  if "login" in html.lower()[:5000] and len(html) < 400000:
+                      print("检测到登录墙")
+                      return []
+                  
                   matches = re.findall(r'/status/(\d{15,25})', html)
-                  print(f"syndication 匹配数: {len(matches)}")
+                  
+                  if not matches:
+                      try:
+                          links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/status/"]')
+                          for link in links:
+                              href = link.get_attribute("href") or ""
+                              m = re.search(r'/status/(\d{15,25})', href)
+                              if m:
+                                  matches.append(m.group(1))
+                      except:
+                          pass
+                  
+                  print(f"匹配数: {len(matches)}")
                   return matches
               except Exception as e:
-                  print(f"syndication 失败: {e}")
+                  print(f"直接访问失败: {e}")
                   return []
+              finally:
+                  driver.quit()
 
-          # 方法2: Twitter Publish oEmbed API
-          def try_publish():
-              url = f"https://publish.twitter.com/oembed?url=https://twitter.com/{target_user}"
-              headers = {
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-              }
+          def try_search(user):
+              """通过搜索页面获取"""
+              driver = create_driver()
               try:
-                  req = urllib.request.Request(url, headers=headers)
-                  resp = urllib.request.urlopen(req, timeout=30)
-                  data = json.loads(resp.read().decode("utf-8"))
-                  html = data.get("html", "")
-                  print(f"publish API 获取成功")
+                  url = f"https://x.com/search?q=from%3A{user}&src=typed_query&f=live"
+                  print(f"搜索访问: {url}")
+                  driver.get(url)
+                  time.sleep(15)
+                  html = driver.page_source
+                  print(f"搜索页面长度: {len(html)}")
                   matches = re.findall(r'/status/(\d{15,25})', html)
+                  print(f"搜索匹配数: {len(matches)}")
                   return matches
               except Exception as e:
-                  print(f"publish 失败: {e}")
+                  print(f"搜索失败: {e}")
                   return []
+              finally:
+                  driver.quit()
 
-          # 方法3: 使用 Nitter 替代实例
-          def try_nitter():
-              instances = [
-                  f"https://nitter.poast.org/{target_user}",
-                  f"https://nitter.privacydev.net/{target_user}",
-                  f"https://nitter.net/{target_user}",
-                  f"https://xcancel.com/{target_user}",
-                  f"https://twiiit.com/{target_user}",
-              ]
-              headers = {
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-              }
-              for inst_url in instances:
-                  try:
-                      req = urllib.request.Request(inst_url, headers=headers)
-                      resp = urllib.request.urlopen(req, timeout=15)
-                      html = resp.read().decode("utf-8", errors="ignore")
-                      matches = re.findall(r'/status/(\d{15,25})', html)
-                      if matches:
-                          print(f"{inst_url} 成功，匹配数: {len(matches)}")
-                          return matches
-                      else:
-                          print(f"{inst_url} 无匹配")
-                  except Exception as e:
-                      print(f"{inst_url} 失败: {e}")
-              return []
+          def try_embed(user):
+              """通过嵌入页面获取"""
+              driver = create_driver()
+              try:
+                  url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{user}"
+                  print(f"嵌入访问: {url}")
+                  driver.get(url)
+                  time.sleep(10)
+                  html = driver.page_source
+                  print(f"嵌入页面长度: {len(html)}")
+                  matches = re.findall(r'/status/(\d{15,25})', html)
+                  print(f"嵌入匹配数: {len(matches)}")
+                  return matches
+              except Exception as e:
+                  print(f"嵌入失败: {e}")
+                  return []
+              finally:
+                  driver.quit()
 
-          # 方法4: 使用 RSS Bridge
-          def try_rssbridge():
-              bridges = [
-                  f"https://rss-bridge.org/bridge01/?action=display&bridge=TwitterBridge&context=By+username&u={target_user}&format=Html",
-              ]
-              headers = {
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-              }
-              for bridge_url in bridges:
-                  try:
-                      req = urllib.request.Request(bridge_url, headers=headers)
-                      resp = urllib.request.urlopen(req, timeout=30)
-                      html = resp.read().decode("utf-8", errors="ignore")
-                      matches = re.findall(r'/status/(\d{15,25})', html)
-                      if matches:
-                          print(f"RSS Bridge 成功，匹配数: {len(matches)}")
-                          return matches
-                      else:
-                          print(f"RSS Bridge 无匹配")
-                  except Exception as e:
-                      print(f"RSS Bridge 失败: {e}")
-              return []
-
-          # 依次尝试所有方法
-          print("=== 尝试方法1: syndication ===")
-          all_matches = try_syndication()
+          # 依次尝试3种方法
+          print("=== 方法1: 直接访问 ===")
+          all_matches = try_direct(target_user)
 
           if not all_matches:
-              print("=== 尝试方法2: publish ===")
-              all_matches = try_publish()
+              print("\n=== 方法2: 搜索页面 ===")
+              all_matches = try_search(target_user)
 
           if not all_matches:
-              print("=== 尝试方法3: nitter ===")
-              all_matches = try_nitter()
-
-          if not all_matches:
-              print("=== 尝试方法4: RSS Bridge ===")
-              all_matches = try_rssbridge()
+              print("\n=== 方法3: 嵌入页面 ===")
+              all_matches = try_embed(target_user)
 
           # 去重保留前5条
           seen = []
@@ -147,7 +174,7 @@ jobs:
           print(f"\n最终推文ID: {tweet_ids}")
 
           if not tweet_ids:
-              print("所有方法都失败了")
+              print("本次未获取到推文，等待下次重试")
               exit(0)
 
           # 读取历史
@@ -163,7 +190,6 @@ jobs:
 
           print(f"上次推文ID: {old_tweets}")
 
-          # 对比
           new_tweets = [t for t in tweet_ids if t not in old_tweets]
           should_send = first_run or len(new_tweets) > 0
 
@@ -192,8 +218,6 @@ jobs:
                       print("邮件已发送")
                   except Exception as e:
                       print(f"邮件发送失败: {e}")
-              else:
-                  print("邮箱未配置")
           else:
               print("没有新推文")
 
