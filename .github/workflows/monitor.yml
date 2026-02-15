@@ -2,7 +2,7 @@ name: Monitor
 
 on:
   schedule:
-    - cron: '*/3 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -39,41 +39,70 @@ jobs:
           from email.mime.text import MIMEText
           from selenium import webdriver
           from selenium.webdriver.chrome.options import Options
-          from selenium.webdriver.chrome.service import Service
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
 
           target_user = os.environ.get("TARGET_USER", "")
 
-          # 设置无头浏览器
           options = Options()
-          options.add_argument("--headless")
+          options.add_argument("--headless=new")
           options.add_argument("--no-sandbox")
           options.add_argument("--disable-dev-shm-usage")
           options.add_argument("--disable-gpu")
+          options.add_argument("--disable-blink-features=AutomationControlled")
           options.add_argument("--window-size=1920,1080")
           options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+          options.add_experimental_option("excludeSwitches", ["enable-automation"])
 
           driver = None
           tweet_ids = []
 
           try:
               driver = webdriver.Chrome(options=options)
+              driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+              
               url = f"https://x.com/{target_user}"
               print(f"正在访问: {url}")
               driver.get(url)
 
-              # 等待页面加载
-              time.sleep(10)
+              # 等待页面充分加载
+              print("等待页面加载...")
+              time.sleep(15)
 
+              # 尝试多种方式提取推文ID
               html = driver.page_source
               print(f"页面长度: {len(html)}")
 
-              # 提取推文ID
-              pattern = rf'/{target_user}/status/(\d+)'
-              matches = re.findall(pattern, html, re.IGNORECASE)
+              # 方式1: 从链接中提取
+              pattern1 = r'/status/(\d{15,25})'
+              matches1 = re.findall(pattern1, html)
+              print(f"方式1 匹配数: {len(matches1)}")
+
+              # 方式2: 从data属性中提取
+              pattern2 = r'statusId["\s:]+["\s]*(\d{15,25})'
+              matches2 = re.findall(pattern2, html)
+              print(f"方式2 匹配数: {len(matches2)}")
+
+              # 方式3: 从a标签href提取
+              try:
+                  links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/status/"]')
+                  matches3 = []
+                  for link in links:
+                      href = link.get_attribute("href") or ""
+                      m = re.search(r'/status/(\d{15,25})', href)
+                      if m:
+                          matches3.append(m.group(1))
+                  print(f"方式3 匹配数: {len(matches3)}")
+              except:
+                  matches3 = []
+
+              # 合并所有结果
+              all_matches = matches1 + matches2 + matches3
 
               # 去重保留前5条
               seen = []
-              for tid in matches:
+              for tid in all_matches:
                   if tid not in seen:
                       seen.append(tid)
                   if len(seen) >= 5:
@@ -82,34 +111,52 @@ jobs:
               tweet_ids = seen
               print(f"当前推文ID: {tweet_ids}")
 
+              # 如果还是空的，保存页面用于调试
+              if not tweet_ids:
+                  # 保存前2000字符看看页面内容
+                  print("=== 页面内容片段 ===")
+                  print(html[:2000])
+                  print("=== 结束 ===")
+                  
+                  # 检查是否有登录墙
+                  if "login" in html.lower() or "sign in" in html.lower():
+                      print("检测到登录墙!")
+                  if "suspende" in html.lower():
+                      print("账号可能被封!")
+
           except Exception as e:
               print(f"浏览器访问出错: {e}")
           finally:
               if driver:
                   driver.quit()
 
-          if not tweet_ids:
-              print("未获取到推文，退出")
-              exit(0)
-
-          # 读取历史记录
+          # 不管有没有推文，第一次运行都发一封测试邮件
           history_file = "last_tweets.json"
           old_tweets = []
+          first_run = False
+
           if os.path.exists(history_file):
               with open(history_file, "r") as f:
                   old_tweets = json.load(f)
+          else:
+              first_run = True
 
           print(f"上次推文ID: {old_tweets}")
+          print(f"是否首次运行: {first_run}")
 
-          # 对比找新推文
+          # 判断是否需要发邮件
           new_tweets = [t for t in tweet_ids if t not in old_tweets]
+          should_send = first_run or len(new_tweets) > 0
 
-          if new_tweets:
-              print(f"发现 {len(new_tweets)} 条新推文!")
-
-              # 只发URL
-              links = [f"https://x.com/i/status/{tid}" for tid in new_tweets]
-              body = "检测到新内容:\n\n" + "\n".join(links)
+          if should_send:
+              if tweet_ids:
+                  links = [f"https://x.com/i/status/{tid}" for tid in (new_tweets if new_tweets else tweet_ids)]
+                  if first_run:
+                      body = "首次运行，当前内容:\n\n" + "\n".join(links)
+                  else:
+                      body = "检测到新内容:\n\n" + "\n".join(links)
+              else:
+                  body = "监控已启动，但暂时无法获取内容。请检查日志。"
 
               email_to = os.environ.get("EMAIL_TO", "")
               email_from = os.environ.get("EMAIL_FROM", "")
@@ -131,13 +178,14 @@ jobs:
                       print(f"邮件发送失败: {e}")
               else:
                   print("邮箱未配置")
-                  print(body)
+                  print(f"内容: {body}")
           else:
-              print("没有新推文")
+              print("没有新推文，不发邮件")
 
-          # 保存当前状态
-          with open(history_file, "w") as f:
-              json.dump(tweet_ids, f)
+          # 保存状态
+          if tweet_ids:
+              with open(history_file, "w") as f:
+                  json.dump(tweet_ids, f)
 
           PYEOF
 
