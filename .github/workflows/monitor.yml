@@ -27,6 +27,7 @@ jobs:
           import re
           import smtplib
           import urllib.request
+          import urllib.parse
           from email.mime.text import MIMEText
 
           target_user = os.environ.get("TARGET_USER", "")
@@ -34,6 +35,19 @@ jobs:
           ct0 = os.environ.get("CT0", "")
           tweet_ids = []
           cookie_expired = False
+
+          BEARER = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+
+          def make_headers():
+              return {
+                  "Authorization": BEARER,
+                  "Cookie": f"auth_token={auth_token}; ct0={ct0}",
+                  "X-Csrf-Token": ct0,
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                  "Content-Type": "application/json",
+                  "X-Twitter-Active-User": "yes",
+                  "X-Twitter-Client-Language": "en",
+              }
 
           def send_email(subject, body):
               email_to = os.environ.get("EMAIL_TO", "")
@@ -56,39 +70,58 @@ jobs:
                       return False
               return False
 
-          # 使用 Twitter API 获取用户推文
-          def get_user_id(username):
-              """获取用户ID"""
-              url = f"https://api.twitter.com/graphql/xmU6X_CKVnQ5lSrCbAmJsg/UserByScreenName?variables=%7B%22screen_name%22%3A%22{username}%22%7D&features=%7B%22hidden_profile_subscriptions_enabled%22%3Atrue%2C%22profile_label_improvements_pcf_label_in_post_enabled%22%3Afalse%2C%22rweb_tipjar_consumption_enabled%22%3Atrue%2C%22responsive_web_graphql_exclude_directive_enabled%22%3Atrue%2C%22verified_phone_label_enabled%22%3Afalse%2C%22subscriptions_verification_info_is_identity_verified_enabled%22%3Atrue%2C%22subscriptions_verification_info_verified_since_enabled%22%3Atrue%2C%22highlights_tweets_tab_ui_enabled%22%3Atrue%2C%22responsive_web_twitter_article_notes_tab_enabled%22%3Atrue%2C%22subscriptions_feature_can_gift_premium%22%3Atrue%2C%22creator_subscriptions_tweet_preview_api_enabled%22%3Atrue%2C%22responsive_web_graphql_skip_user_profile_image_extensions_enabled%22%3Afalse%2C%22responsive_web_graphql_timeline_navigation_enabled%22%3Atrue%7D"
-              headers = {
-                  "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
-                  "Cookie": f"auth_token={auth_token}; ct0={ct0}",
-                  "X-Csrf-Token": ct0,
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                  "Content-Type": "application/json",
-              }
+          # 方法1: v2 API
+          def try_v2_api(user_id):
+              print("尝试 v2 API...")
+              url = f"https://api.twitter.com/2/users/{user_id}/tweets?max_results=5&tweet.fields=created_at"
               try:
-                  req = urllib.request.Request(url, headers=headers)
+                  req = urllib.request.Request(url, headers=make_headers())
                   resp = urllib.request.urlopen(req, timeout=30)
                   data = json.loads(resp.read().decode("utf-8"))
-                  user_id = data["data"]["user"]["result"]["rest_id"]
-                  print(f"用户ID: {user_id}")
-                  return user_id
+                  ids = [t["id"] for t in data.get("data", [])]
+                  print(f"v2 API 获取到: {ids}")
+                  return ids
+              except urllib.error.HTTPError as e:
+                  print(f"v2 API 失败: HTTP {e.code}")
+                  if e.code in [401, 403]:
+                      return "EXPIRED"
+                  return []
               except Exception as e:
-                  print(f"获取用户ID失败: {e}")
-                  return None
+                  print(f"v2 API 失败: {e}")
+                  return []
 
-          def get_tweets(user_id):
-              """获取用户最新推文"""
-              variables = json.dumps({
+          # 方法2: v1.1 API
+          def try_v1_api(user_id):
+              print("尝试 v1.1 API...")
+              url = f"https://api.twitter.com/1.1/statuses/user_timeline.json?user_id={user_id}&count=5&include_rts=true"
+              try:
+                  req = urllib.request.Request(url, headers=make_headers())
+                  resp = urllib.request.urlopen(req, timeout=30)
+                  data = json.loads(resp.read().decode("utf-8"))
+                  ids = [str(t["id"]) for t in data]
+                  print(f"v1.1 API 获取到: {ids}")
+                  return ids
+              except urllib.error.HTTPError as e:
+                  print(f"v1.1 API 失败: HTTP {e.code}")
+                  if e.code in [401, 403]:
+                      return "EXPIRED"
+                  return []
+              except Exception as e:
+                  print(f"v1.1 API 失败: {e}")
+                  return []
+
+          # 方法3: GraphQL UserTweets
+          def try_graphql(user_id):
+              print("尝试 GraphQL API...")
+              variables = {
                   "userId": user_id,
                   "count": 5,
                   "includePromotedContent": False,
-                  "withQuickPromoteEligibilityTweetFields": False,
+                  "withQuickPromoteEligibilityTweetFields": True,
                   "withVoice": True,
                   "withV2Timeline": True
-              })
-              features = json.dumps({
+              }
+              features = {
                   "rweb_tipjar_consumption_enabled": True,
                   "responsive_web_graphql_exclude_directive_enabled": True,
                   "verified_phone_label_enabled": False,
@@ -112,100 +145,112 @@ jobs:
                   "longform_notetweets_rich_text_read_enabled": True,
                   "longform_notetweets_inline_media_enabled": True,
                   "responsive_web_enhance_cards_enabled": False
-              })
-              
-              url = f"https://api.twitter.com/graphql/Y4wN5m2LBSVAwwlKSVx9wA/UserTweets?variables={urllib.parse.quote(variables)}&features={urllib.parse.quote(features)}"
-              
-              headers = {
-                  "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
-                  "Cookie": f"auth_token={auth_token}; ct0={ct0}",
-                  "X-Csrf-Token": ct0,
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                  "Content-Type": "application/json",
               }
-              try:
-                  req = urllib.request.Request(url, headers=headers)
-                  resp = urllib.request.urlopen(req, timeout=30)
-                  data = json.loads(resp.read().decode("utf-8"))
-                  return data
-              except urllib.error.HTTPError as e:
-                  if e.code == 401 or e.code == 403:
-                      print(f"认证失败 (HTTP {e.code}): Cookie可能已失效!")
-                      return "EXPIRED"
-                  print(f"获取推文失败: HTTP {e.code}")
-                  return None
-              except Exception as e:
-                  print(f"获取推文失败: {e}")
-                  return None
+              
+              v_str = urllib.parse.quote(json.dumps(variables))
+              f_str = urllib.parse.quote(json.dumps(features))
+              
+              # 尝试多个已知的 GraphQL endpoint
+              endpoints = [
+                  "V7H0Ap3_Hh2FyS75OCDO3Q",
+                  "CdG2Vuc1v6F5JyEngGpxVw",
+                  "WzJjibAcDa-oCjCcLOotcg",
+                  "eS7LO5Jy3xgmd3dbL044EA",
+              ]
+              
+              for ep in endpoints:
+                  try:
+                      url = f"https://api.twitter.com/graphql/{ep}/UserTweets?variables={v_str}&features={f_str}"
+                      req = urllib.request.Request(url, headers=make_headers())
+                      resp = urllib.request.urlopen(req, timeout=30)
+                      data = json.loads(resp.read().decode("utf-8"))
+                      text = json.dumps(data)
+                      
+                      # 提取推文ID
+                      matches = re.findall(r'"rest_id"\s*:\s*"(\d{18,25})"', text)
+                      
+                      # 过滤：排除用户ID本身
+                      filtered = []
+                      for m in matches:
+                          if m != user_id and m not in filtered:
+                              filtered.append(m)
+                          if len(filtered) >= 5:
+                              break
+                      
+                      if filtered:
+                          print(f"GraphQL endpoint {ep} 成功: {filtered}")
+                          return filtered
+                      else:
+                          print(f"GraphQL endpoint {ep} 无推文")
+                  except urllib.error.HTTPError as e:
+                      print(f"GraphQL endpoint {ep} 失败: HTTP {e.code}")
+                      if e.code in [401, 403]:
+                          return "EXPIRED"
+                  except Exception as e:
+                      print(f"GraphQL endpoint {ep} 失败: {e}")
+              return []
 
-          def extract_tweet_ids(data):
-              """从API返回数据中提取推文ID"""
-              ids = []
-              try:
-                  text = json.dumps(data)
-                  matches = re.findall(r'"rest_id"\s*:\s*"(\d{15,25})"', text)
-                  # 过滤掉用户ID，只保留推文ID
-                  for m in matches:
-                      if m not in ids and len(m) >= 18:
-                          ids.append(m)
-                      if len(ids) >= 5:
-                          break
-              except:
-                  pass
-              return ids
-
-          # 记录连续失败次数
-          fail_file = "fail_count.json"
-          fail_count = 0
-          if os.path.exists(fail_file):
-              with open(fail_file, "r") as f:
-                  fail_count = json.load(f).get("count", 0)
-
-          import urllib.parse
-
-          # 开始执行
+          # 获取用户ID
           print("=== 获取用户ID ===")
-          user_id = get_user_id(target_user)
+          user_id = "1588419108147560448"
+          print(f"用户ID: {user_id}")
 
-          if user_id is None:
-              print("无法获取用户ID，可能Cookie已失效")
+          # 依次尝试3种方法
+          print("\n=== 方法1: v2 API ===")
+          result = try_v2_api(user_id)
+
+          if result == "EXPIRED":
               cookie_expired = True
+          elif result:
+              tweet_ids = result
           else:
-              print(f"\n=== 获取推文 ===")
-              result = get_tweets(user_id)
+              print("\n=== 方法2: v1.1 API ===")
+              result = try_v1_api(user_id)
               
               if result == "EXPIRED":
                   cookie_expired = True
-              elif result is not None:
-                  tweet_ids = extract_tweet_ids(result)
-                  print(f"提取到推文ID: {tweet_ids}")
+              elif result:
+                  tweet_ids = result
               else:
-                  print("获取推文返回空")
+                  print("\n=== 方法3: GraphQL API ===")
+                  result = try_graphql(user_id)
+                  
+                  if result == "EXPIRED":
+                      cookie_expired = True
+                  elif result:
+                      tweet_ids = result
 
-          # Cookie失效通知
+          print(f"\n最终推文ID: {tweet_ids}")
+
+          # Cookie失效处理
           if cookie_expired:
-              fail_count += 1
-              print(f"连续失败次数: {fail_count}")
+              fail_file = "fail_count.json"
+              fail_count = 0
+              if os.path.exists(fail_file):
+                  with open(fail_file, "r") as f:
+                      fail_count = json.load(f).get("count", 0)
               
-              # 连续失败3次才发邮件，避免偶尔的网络问题
+              fail_count += 1
+              print(f"认证失败，连续失败次数: {fail_count}")
+              
               if fail_count >= 3:
                   send_email(
-                      "⚠️ 监控异常",
-                      "Cookie可能已失效，请重新获取auth_token和ct0并更新GitHub Secrets。\n\n操作步骤:\n1. 浏览器登录x.com\n2. F12 → Application → Cookies → x.com\n3. 复制auth_token和ct0的值\n4. 去GitHub仓库Settings → Secrets更新"
+                      "监控异常提醒",
+                      "认证信息可能已失效，请重新获取:\n\n1. 浏览器登录x.com\n2. F12 → Application → Cookies → x.com\n3. 复制 auth_token 和 ct0\n4. 去GitHub仓库 Settings → Secrets 更新\n\n更新后监控会自动恢复。"
                   )
                   fail_count = 0
               
               with open(fail_file, "w") as f:
                   json.dump({"count": fail_count}, f)
               exit(0)
-          else:
-              # 成功了，重置失败计数
-              fail_count = 0
-              with open(fail_file, "w") as f:
-                  json.dump({"count": 0}, f)
+          
+          # 重置失败计数
+          fail_file = "fail_count.json"
+          with open(fail_file, "w") as f:
+              json.dump({"count": 0}, f)
 
           if not tweet_ids:
-              print("未提取到推文ID")
+              print("未获取到推文")
               exit(0)
 
           # 读取历史
