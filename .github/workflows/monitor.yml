@@ -55,13 +55,11 @@ jobs:
 
           now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
 
-          # 只在异常时发邮件
           def send_alert(reason, detail):
               email_to = os.environ.get("EMAIL_TO", "")
               email_from = os.environ.get("EMAIL_FROM", "")
               email_password = os.environ.get("EMAIL_PASSWORD", "")
               if not (email_to and email_from and email_password):
-                  print("邮箱未配置，无法发送告警")
                   return
               body = f"监控异常通知\n\n时间: {now}\n\n异常原因: {reason}\n\n详细信息: {detail}\n\n处理方式: 请根据以上原因进行修复。如果是Cookie失效，请重新获取auth_token和ct0并更新GitHub Secrets。"
               try:
@@ -77,7 +75,7 @@ jobs:
               except Exception as e:
                   print(f"告警邮件发送失败: {e}")
 
-          # 读取失败计数和告警记录
+          # 读取失败计数
           fail_file = "fail_count.json"
           fail_data = {"count": 0, "last_alert": "", "alert_reasons": []}
           if os.path.exists(fail_file):
@@ -91,10 +89,10 @@ jobs:
           last_alert = fail_data.get("last_alert", "")
           alert_reasons = fail_data.get("alert_reasons", [])
 
-          # 解密读取旧数据
+          # 读取历史直播记录
           history_file = "history.json"
           zip_file = "data.zip"
-          old_data = {"tweets": [], "log": [], "last_check": "", "status": ""}
+          old_data = {"broadcasts": [], "last_check": "", "status": ""}
 
           if os.path.exists(zip_file):
               try:
@@ -109,10 +107,10 @@ jobs:
               except Exception as e:
                   print(f"解密旧文件失败: {e}")
 
-          old_tweets = old_data.get("tweets", [])
-          log = old_data.get("log", [])
+          old_broadcasts = old_data.get("broadcasts", [])
+          old_broadcast_urls = [b["url"] for b in old_broadcasts]
 
-          # 用浏览器+Cookie访问
+          # 浏览器访问
           options = Options()
           options.add_argument("--headless=new")
           options.add_argument("--no-sandbox")
@@ -124,20 +122,19 @@ jobs:
           options.add_experimental_option("excludeSwitches", ["enable-automation"])
 
           driver = None
-          tweet_ids = []
+          broadcast_links = []
           error_reason = ""
           status = "unknown"
+          page_ok = False
 
           try:
               driver = webdriver.Chrome(options=options)
               driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-              # 设置Cookie
               print("正在设置Cookie...")
               driver.get("https://x.com")
               time.sleep(3)
 
-              # 检查Cookie是否为空
               if not auth_token or not ct0:
                   error_reason = "Cookie未配置"
                   status = "异常: Cookie未配置"
@@ -155,76 +152,67 @@ jobs:
                   page_len = len(html)
                   print(f"页面长度: {page_len}")
 
-                  # 检测各种异常
                   html_lower = html[:5000].lower()
 
                   if page_len < 10000:
                       error_reason = "页面内容过短，可能被封锁"
                       status = f"异常: 页面仅{page_len}字节"
-                      print(status)
-
-                  elif "account suspended" in html_lower or "account is suspended" in html_lower:
+                  elif "account suspended" in html_lower:
                       error_reason = "目标账号已被封禁"
                       status = "异常: 目标账号被封禁"
-                      print(status)
-
-                  elif "doesn't exist" in html_lower or "this account doesn" in html_lower:
+                  elif "doesn't exist" in html_lower:
                       error_reason = "目标账号不存在或已注销"
                       status = "异常: 目标账号不存在"
-                      print(status)
-
                   elif "rate limit" in html_lower or "try again later" in html_lower:
                       error_reason = "访问频率受限，被X限流"
                       status = "异常: 被限流"
-                      print(status)
-
                   elif ("login" in html_lower or "sign in" in html_lower) and "logout" not in html_lower:
-                      # 有login但没有logout，说明没登录成功
                       error_reason = "Cookie已失效，需要重新获取auth_token和ct0"
                       status = "异常: Cookie失效"
-                      print(status)
-
                   else:
-                      # 页面正常，提取推文
-                      matches = re.findall(r'/status/(\d{18,25})', html)
-                      print(f"正则匹配数: {len(matches)}")
+                      page_ok = True
+                      status = "正常运行中"
 
+                      # 只提取 broadcast 链接
+                      # 方式1: 正则匹配所有broadcast链接
+                      broadcast_matches = re.findall(r'https?://[^\s"\'<>]*broadcast[^\s"\'<>]*', html, re.IGNORECASE)
+                      print(f"正则broadcast匹配数: {len(broadcast_matches)}")
+
+                      # 方式2: 从a标签提取
                       try:
-                          links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/status/"]')
-                          for link in links:
+                          all_links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="broadcast"]')
+                          for link in all_links:
                               href = link.get_attribute("href") or ""
-                              m = re.search(r'/status/(\d{18,25})', href)
-                              if m:
-                                  matches.append(m.group(1))
-                          print(f"链接匹配后总数: {len(matches)}")
+                              if href and "broadcast" in href.lower():
+                                  broadcast_matches.append(href)
+                          print(f"a标签broadcast匹配数: {len(broadcast_matches)}")
                       except:
                           pass
 
+                      # 方式3: 从article中提取
                       try:
                           articles = driver.find_elements(By.CSS_SELECTOR, 'article')
                           for article in articles:
                               article_html = article.get_attribute("innerHTML") or ""
-                              article_matches = re.findall(r'/status/(\d{18,25})', article_html)
-                              matches.extend(article_matches)
-                          print(f"article匹配后总数: {len(matches)}")
+                              article_broadcasts = re.findall(r'https?://[^\s"\'<>]*broadcast[^\s"\'<>]*', article_html, re.IGNORECASE)
+                              broadcast_matches.extend(article_broadcasts)
+                          print(f"article broadcast匹配数: {len(broadcast_matches)}")
                       except:
                           pass
 
+                      # 去重
                       seen = []
-                      for tid in matches:
-                          if tid not in seen:
-                              seen.append(tid)
-                          if len(seen) >= 5:
-                              break
+                      for link in broadcast_matches:
+                          # 清理链接
+                          link = link.strip().rstrip('\\').rstrip('"').rstrip("'")
+                          if link not in seen:
+                              seen.append(link)
 
-                      tweet_ids = seen
-                      print(f"最终推文ID: {tweet_ids}")
+                      broadcast_links = seen
+                      print(f"最终broadcast链接: {broadcast_links}")
 
-                      if tweet_ids:
-                          status = "正常运行中"
-                      else:
-                          error_reason = "页面加载正常但未找到推文，可能页面结构变化"
-                          status = "异常: 无法提取推文"
+                  if error_reason:
+                      print(status)
 
           except Exception as e:
               error_reason = f"浏览器运行出错: {str(e)}"
@@ -234,63 +222,44 @@ jobs:
               if driver:
                   driver.quit()
 
-          # 处理异常告警
+          # 异常告警
           if error_reason:
               fail_count += 1
               print(f"连续失败次数: {fail_count}")
-
-              # 记录失败原因
               if error_reason not in alert_reasons:
                   alert_reasons.append(error_reason)
-
-              # 连续失败5次发一封告警邮件
-              # 之后每50次再发一次，避免邮件轰炸
-              should_alert = False
-              if fail_count == 5:
-                  should_alert = True
-              elif fail_count > 5 and fail_count % 50 == 0:
-                  should_alert = True
-
-              if should_alert:
+              if fail_count == 5 or (fail_count > 5 and fail_count % 50 == 0):
                   all_reasons = "\n".join([f"  - {r}" for r in alert_reasons])
-                  send_alert(
-                      error_reason,
-                      f"连续失败次数: {fail_count}\n\n出现过的异常:\n{all_reasons}"
-                  )
+                  send_alert(error_reason, f"连续失败次数: {fail_count}\n\n出现过的异常:\n{all_reasons}")
                   last_alert = now
-
-              fail_data = {
-                  "count": fail_count,
-                  "last_alert": last_alert,
-                  "alert_reasons": alert_reasons
-              }
+              fail_data = {"count": fail_count, "last_alert": last_alert, "alert_reasons": alert_reasons}
           else:
-              # 成功了，重置
               if fail_count > 0:
                   print(f"恢复正常！之前连续失败了{fail_count}次")
               fail_data = {"count": 0, "last_alert": "", "alert_reasons": []}
 
-          # 保存失败计数
           with open(fail_file, "w") as f:
               json.dump(fail_data, f, ensure_ascii=False)
 
-          # 对比新旧推文
-          if tweet_ids:
-              new_tweets = [t for t in tweet_ids if t not in old_tweets]
-              if new_tweets:
-                  print(f"发现 {len(new_tweets)} 条新推文!")
-                  for tid in new_tweets:
-                      log.append({
+          # 处理直播链接
+          if broadcast_links:
+              new_broadcasts = [b for b in broadcast_links if b not in old_broadcast_urls]
+              if new_broadcasts:
+                  print(f"发现 {len(new_broadcasts)} 个新直播链接!")
+                  for b in new_broadcasts:
+                      old_broadcasts.append({
                           "time": now,
-                          "url": f"https://x.com/i/status/{tid}"
+                          "url": b
                       })
               else:
-                  print("没有新推文")
-
-          # 保存数据（不管成功失败都保存）
+                  print("直播链接已记录过")
+          else:
+              if page_ok:
+                  print("当前没有直播")
+              
+          # 保存数据
           save_data = {
-              "tweets": tweet_ids if tweet_ids else old_tweets,
-              "log": log,
+              "broadcasts": old_broadcasts,
               "last_check": now,
               "status": status
           }
@@ -298,11 +267,9 @@ jobs:
           with open(history_file, "w") as f:
               json.dump(save_data, f, ensure_ascii=False, indent=2)
 
-          # 删除旧ZIP
           if os.path.exists(zip_file):
               os.remove(zip_file)
 
-          # 创建加密ZIP
           result = subprocess.run(
               ["minizip", "-P", file_password, zip_file, history_file],
               capture_output=True, text=True, timeout=10
@@ -313,12 +280,12 @@ jobs:
                   capture_output=True, text=True, timeout=10
               )
 
-          # 删除明文
           if os.path.exists(history_file):
               os.remove(history_file)
 
           print(f"\n状态: {status}")
           print(f"时间: {now}")
+          print(f"历史直播记录数: {len(old_broadcasts)}")
 
           PYEOF
 
