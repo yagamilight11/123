@@ -1,1 +1,1 @@
-{"count": 1, "last_alert": "", "alert_reasons": ["浏览器运行出错: HTTPConnectionPool(host='localhost', port=37439): Read timed out. (read timeout=120)"]}
+{"count": 0, "last_alert": "", "alert_reasons": []}
